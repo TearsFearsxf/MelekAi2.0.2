@@ -1,0 +1,1113 @@
+import json
+import csv
+import sqlite3
+import os
+import webbrowser
+from datetime import datetime
+import tkinter as tk
+from tkinter import ttk, filedialog, messagebox
+from collections import Counter
+import math
+import re
+import threading
+import time
+
+# Ek kütüphaneler: makine öğrenimi, görselleştirme, NLP ve sesli çıktı/girdi
+import numpy as np
+from sklearn.feature_extraction.text import TfidfVectorizer
+from sklearn.linear_model import LogisticRegression
+from sklearn.cluster import KMeans
+import matplotlib.pyplot as plt
+from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg
+
+import nltk
+try:
+    nltk.download('vader_lexicon', quiet=True)
+    from nltk.sentiment import SentimentIntensityAnalyzer
+except Exception as e:
+    print("NLTK VADER indirilirken hata oluştu:", e)
+    SentimentIntensityAnalyzer = None
+
+import pyttsx3
+
+# VOSK ve pyaudio: offline ses tanıma için (model klasörü gereklidir)
+try:
+    from vosk import Model, KaldiRecognizer
+    import pyaudio
+    vosk_available = True
+except ImportError:
+    vosk_available = False
+
+# Yardımcı fonksiyon: Sayıyı Türkçe söze çevirir (0-59 arası)
+def number_to_turkish(n):
+    words = {
+        0: "sıfır", 1: "bir", 2: "iki", 3: "üç", 4: "dört",
+        5: "beş", 6: "altı", 7: "yedi", 8: "sekiz", 9: "dokuz",
+        10: "on", 11: "on bir", 12: "on iki", 13: "on üç", 14: "on dört",
+        15: "on beş", 16: "on altı", 17: "on yedi", 18: "on sekiz", 19: "on dokuz",
+        20: "yirmi", 30: "otuz", 40: "kırk", 50: "elli"
+    }
+    if n <= 20 or n in [30, 40, 50]:
+        return words.get(n, str(n))
+    elif n < 30:
+        return "yirmi " + words[n - 20]
+    elif n < 40:
+        return "otuz " + words[n - 30]
+    elif n < 50:
+        return "kırk " + words[n - 40]
+    elif n < 60:
+        return "elli " + words[n - 50]
+    else:
+        return str(n)
+
+# Basit Parquet simülasyonu (bağımlılıksız)
+def read_parquet_simple(file_path):
+    try:
+        with open(file_path, "r", encoding="utf-8") as f:
+            lines = f.readlines()
+        data = []
+        headers = lines[0].strip().split(",")
+        for line in lines[1:]:
+            values = line.strip().split(",")
+            data.append(dict(zip(headers, values)))
+        return data
+    except Exception as e:
+        messagebox.showerror("Hata", f"Parquet okuma hatası: {e}")
+        return None
+
+def write_parquet_simple(file_path, data):
+    try:
+        with open(file_path, "w", encoding="utf-8") as f:
+            if data:
+                headers = list(data[0].keys())
+                f.write(",".join(headers) + "\n")
+                for item in data:
+                    values = [str(item.get(h, "")) for h in headers]
+                    f.write(",".join(values) + "\n")
+    except Exception as e:
+        messagebox.showerror("Hata", f"Parquet yazma hatası: {e}")
+
+# Matematiksel yanıt formatını ayrıştırma fonksiyonu
+def parse_answer_format(answer_text):
+    if isinstance(answer_text, str):
+        lines = answer_text.strip().split("\n")
+        steps = []
+        final = ""
+        for line in lines:
+            if line.startswith("####"):
+                final = line.replace("####", "").strip()
+            else:
+                steps.append(line.strip())
+        return {"steps": "\n".join(steps), "final": final}
+    return {"steps": str(answer_text), "final": ""}
+
+# Veri normalizasyon fonksiyonu (Geliştirilmiş)
+def normalize_data_format(item):
+    question_keys = ["question", "soru", "query", "prompt"]
+    answer_keys = ["answer", "answers", "cevap", "cevaplar", "response"]
+
+    # Soru anahtarını bul
+    for q_key in question_keys:
+        if q_key in item:
+            question = item[q_key]
+            break
+    else:
+        question = ""
+
+    # Cevap anahtarını bul ve ayrıştır
+    for a_key in answer_keys:
+        if a_key in item:
+            answers = parse_answer_format(item[a_key])
+            break
+    else:
+        answers = {"steps": "", "final": ""}
+
+    return {"question": question, "answers": answers}
+
+# Asistan Sınıfı
+class MelekAssistant:
+    def __init__(self, dataset_path):
+        self.dataset_path = dataset_path
+        self.dataset = self.load_dataset()
+        self.learned_dataset = []
+        self.learned_data_folder = os.path.join(os.getcwd(), "öğrenilen_veri")
+        self.ensure_learned_folder_exists()
+        self.load_learned_data()
+        self.mode = "passive"
+        # Makine öğrenimi modelleri
+        self.tf_idf_model = {}
+        self.supervised_model = None
+        self.supervised_vectorizer = None
+        self.unsupervised_model = None
+        self.unsupervised_vectorizer = None
+        self.unsupervised_labels = None
+
+        # Sohbet ve diyalog yönetimi
+        self.chat_history = []  # (timestamp, speaker, message)
+        
+        # Duygu analizi
+        if SentimentIntensityAnalyzer is not None:
+            self.sentiment_analyzer = SentimentIntensityAnalyzer()
+        else:
+            self.sentiment_analyzer = None
+
+        # TTS motoru
+        self.tts_engine = pyttsx3.init()
+
+        # VOSK ile offline STT
+        self.vosk_model = None
+        self.speech_recognizer = None
+        if vosk_available:
+            try:
+                # "model" klasörünün uygun VOSK modeli içerdiğini varsayıyoruz
+                self.vosk_model = Model("model")
+                self.speech_recognizer = KaldiRecognizer(self.vosk_model, 16000)
+                self.pyaudio_instance = pyaudio.PyAudio()
+            except Exception as e:
+                print("VOSK başlatılamadı:", e)
+                self.vosk_model = None
+
+        print("Başlangıç modu: Pasif Mod")
+        self.train_tf_idf_model()
+
+    def ensure_learned_folder_exists(self):
+        if not os.path.exists(self.learned_data_folder):
+            os.makedirs(self.learned_data_folder)
+
+    def load_dataset(self):
+        try:
+            with open(self.dataset_path, "r", encoding="utf-8") as f:
+                data = json.load(f)
+            return [normalize_data_format(item) for item in data]
+        except Exception as e:
+            print(f"Veri dosyası yüklenemedi: {e}")
+            return []
+
+    def load_learned_data(self, progress_bar=None):
+        self.learned_dataset = []
+        files = [f for f in os.listdir(self.learned_data_folder) if f.lower().endswith((".json", ".csv", ".db", ".parquet"))]
+        if progress_bar:
+            progress_bar["maximum"] = len(files)
+            progress_bar["value"] = 0
+        for i, filename in enumerate(files):
+            file_path = os.path.join(self.learned_data_folder, filename)
+            if filename.endswith(".json"):
+                with open(file_path, "r", encoding="utf-8") as f:
+                    data = json.load(f)
+            elif filename.endswith(".csv"):
+                data = self.read_csv_to_json(file_path)
+            elif filename.endswith(".db"):
+                data = self.read_db_to_json(file_path)
+            elif filename.endswith(".parquet"):
+                data = read_parquet_simple(file_path)
+            if data and isinstance(data, list):
+                normalized_data = [normalize_data_format(item) for item in data]
+                self.learned_dataset.extend(normalized_data)
+            if progress_bar:
+                progress_bar["value"] = i + 1
+                progress_bar.update()
+
+    def find_best_response(self, user_question):
+        return self.predict_with_tf_idf(user_question)
+
+    def convert_time_to_words(self, hour, minute):
+        hour_word = number_to_turkish(hour)
+        minute_word = number_to_turkish(minute)
+        if minute == 0:
+            return f"saat {hour_word} tam"
+        return f"saat {hour_word} {minute_word} geçiyor"
+
+    def log_passive_mode(self, text):
+        try:
+            with open("pasif_mod_kayit.txt", "a", encoding="utf-8") as f:
+                f.write(f"{datetime.now()} - {text}\n")
+        except Exception as e:
+            print(f"Kayıt alınırken hata: {e}")
+
+    def handle_command_mode(self, command):
+        command_lower = command.lower()
+        command_variants = {
+            "youtube": ["youtube aç", "yotube aç", "yotubeyi aç"],
+            "chrome": ["chrome aç", "crom aç", "cromu aç"],
+            "google": ["google'da ara", "google da ara"],
+            "takvim": ["takvim", "takvimi göster"],
+            "not": ["not al", "not yaz"],
+            "hatırlat": ["hatırlat", "beni hatırlat"]
+        }
+        for key, variants in command_variants.items():
+            for variant in variants:
+                if variant in command_lower:
+                    if key == "youtube":
+                        webbrowser.open("https://www.youtube.com")
+                        print("YouTube açıldı.")
+                        return
+                    elif key == "chrome":
+                        try:
+                            os.startfile("C:\\Program Files\\Google\\Chrome\\Application\\chrome.exe")
+                            print("Chrome açıldı.")
+                        except Exception as e:
+                            print(f"Chrome açılamadı: {e}")
+                        return
+                    elif key == "google":
+                        parts = command_lower.split("ara")
+                        if len(parts) > 1:
+                            query = parts[1].strip()
+                            webbrowser.open(f"https://www.google.com/search?q={query}")
+                            print(f"Google'da '{query}' arandı.")
+                        return
+                    elif key == "takvim":
+                        today = datetime.now().strftime("%d/%m/%Y")
+                        messagebox.showinfo("Takvim", f"Bugünün tarihi: {today}")
+                        return
+                    elif key == "not":
+                        note = command_lower.replace("not al", "").strip()
+                        if note:
+                            with open("notlar.txt", "a", encoding="utf-8") as f:
+                                f.write(f"{datetime.now()} - {note}\n")
+                            messagebox.showinfo("Not", "Notunuz kaydedildi.")
+                        else:
+                            messagebox.showwarning("Not", "Lütfen kaydedilecek notu yazın.")
+                        return
+                    elif key == "hatırlat":
+                        reminder = command_lower.replace("hatırlat", "").strip()
+                        if reminder:
+                            messagebox.showinfo("Hatırlatma", f"Hatırlatma: {reminder}")
+                        else:
+                            messagebox.showwarning("Hatırlatma", "Lütfen hatırlatılacak konuyu yazın.")
+                        return
+        print("Bilinmeyen komut.")
+
+    def read_csv_to_json(self, file_path):
+        data = []
+        try:
+            with open(file_path, "r", encoding="utf-8") as f:
+                reader = csv.DictReader(f)
+                for row in reader:
+                    data.append(normalize_data_format(row))
+            return data
+        except Exception as e:
+            messagebox.showerror("Hata", f"CSV okuma hatası: {e}")
+            return None
+
+    def read_db_to_json(self, file_path):
+        try:
+            conn = sqlite3.connect(file_path)
+            cursor = conn.cursor()
+            cursor.execute("SELECT question, answers FROM data")
+            data = [normalize_data_format({"question": row[0], "answers": row[1]}) for row in cursor.fetchall()]
+            conn.close()
+            return data
+        except Exception as e:
+            messagebox.showerror("Hata", f"DB okuma hatası: {e}")
+            return None
+
+    def write_db(self, file_path, data):
+        try:
+            conn = sqlite3.connect(file_path)
+            cursor = conn.cursor()
+            cursor.execute("CREATE TABLE IF NOT EXISTS data (question TEXT, answers TEXT)")
+            cursor.executemany("INSERT INTO data (question, answers) VALUES (?, ?)", 
+                              [(item["question"], json.dumps(item["answers"])) for item in data])
+            conn.commit()
+            conn.close()
+        except Exception as e:
+            messagebox.showerror("Hata", f"DB yazma hatası: {e}")
+
+    def validate_data(self, data, progress_bar=None):
+        corrected_data = []
+        errors = []
+        if progress_bar:
+            progress_bar["maximum"] = len(data)
+            progress_bar["value"] = 0
+        for i, item in enumerate(data):
+            normalized_item = normalize_data_format(item)
+            if not normalized_item["question"] or not normalized_item["answers"]["final"]:
+                errors.append(f"Kayıt {i+1}: 'question' veya 'final answer' eksik.")
+            corrected_data.append(normalized_item)
+            if progress_bar:
+                progress_bar["value"] = i + 1
+                progress_bar.update()
+        return corrected_data, errors
+
+    def train_tf_idf_model(self, progress_bar=None):
+        self.tf_idf_model = {}
+        combined_data = self.dataset + self.learned_dataset
+        doc_count = len(combined_data)
+        if progress_bar:
+            progress_bar["maximum"] = doc_count
+            progress_bar["value"] = 0
+        word_doc_count = Counter()
+        for i, item in enumerate(combined_data):
+            words = set(item["question"].lower().split())
+            for word in words:
+                word_doc_count[word] += 1
+            if progress_bar:
+                progress_bar["value"] = i + 1
+                progress_bar.update()
+        for i, item in enumerate(combined_data):
+            words = item["question"].lower().split()
+            tf_idf_scores = {}
+            word_counts = Counter(words)
+            for word in word_counts:
+                tf = word_counts[word] / len(words)
+                idf = math.log(doc_count / (1 + word_doc_count[word]))
+                tf_idf_scores[word] = tf * idf
+            self.tf_idf_model[item["question"]] = {"scores": tf_idf_scores, "answer": item["answers"]}
+
+    def predict_with_tf_idf(self, text):
+        words = text.lower().split()
+        scores = Counter()
+        for question, data in self.tf_idf_model.items():
+            score = sum(data["scores"].get(word, 0) for word in words)
+            scores[question] = score
+        if scores:
+            best_question = scores.most_common(1)[0][0]
+            answer = self.tf_idf_model[best_question]["answer"]
+            return f"Çözüm:\n{answer['steps']}\nSonuç: {answer['final']}"
+        return "Bilinmiyor"
+
+    # Denetimli Öğrenme: TF-IDF vektörleştirici ve Logistic Regression ile model eğitimi
+    def train_supervised_model(self, progress_bar=None):
+        combined_data = self.dataset + self.learned_dataset
+        if not combined_data:
+            messagebox.showerror("Hata", "Eğitim için yeterli veri yok.")
+            return
+        questions = [item["question"] for item in combined_data]
+        labels = list(range(len(questions)))
+        self.supervised_vectorizer = TfidfVectorizer()
+        X = self.supervised_vectorizer.fit_transform(questions)
+        self.supervised_model = LogisticRegression(max_iter=1000)
+        self.supervised_model.fit(X, labels)
+        messagebox.showinfo("Başarılı", "Denetimli öğrenme modeli eğitildi.")
+
+    def predict_supervised(self, text):
+        if not self.supervised_model or not self.supervised_vectorizer:
+            return "Model eğitilmemiş."
+        X = self.supervised_vectorizer.transform([text])
+        pred = self.supervised_model.predict(X)[0]
+        combined_data = self.dataset + self.learned_dataset
+        if pred < len(combined_data):
+            answer = combined_data[pred]["answers"]
+            return f"Çözüm:\n{answer['steps']}\nSonuç: {answer['final']}"
+        return "Bilinmiyor"
+
+    # Denetimsiz Öğrenme: KMeans ile soruları kümeleme
+    def train_unsupervised_model(self, n_clusters=3, progress_bar=None):
+        combined_data = self.dataset + self.learned_dataset
+        if not combined_data:
+            messagebox.showerror("Hata", "Eğitim için yeterli veri yok.")
+            return
+        questions = [item["question"] for item in combined_data]
+        self.unsupervised_vectorizer = TfidfVectorizer()
+        X = self.unsupervised_vectorizer.fit_transform(questions)
+        self.unsupervised_model = KMeans(n_clusters=n_clusters, random_state=42)
+        self.unsupervised_labels = self.unsupervised_model.fit_predict(X)
+        messagebox.showinfo("Başarılı", f"Denetimsiz öğrenme modeli (K={n_clusters}) eğitildi.")
+
+    def get_unsupervised_clusters(self):
+        clusters = {}
+        combined_data = self.dataset + self.learned_dataset
+        if self.unsupervised_labels is None:
+            return clusters
+        for label, item in zip(self.unsupervised_labels, combined_data):
+            clusters.setdefault(label, []).append(item["question"])
+        return clusters
+
+    # Takviyeli Öğrenme: Basit multi-armed bandit (epsilon-greedy) simülasyonu
+    def run_rl_simulation(self, episodes=1000, epsilon=0.1, alpha=0.1):
+        n_arms = 5
+        true_rewards = [0.2, 0.5, 0.8, 0.3, 0.6]
+        Q = [0.0] * n_arms
+        N = [0] * n_arms
+        rewards_history = []
+        for episode in range(episodes):
+            if np.random.rand() < epsilon:
+                action = np.random.randint(n_arms)
+            else:
+                action = np.argmax(Q)
+            reward = 1 if np.random.rand() < true_rewards[action] else 0
+            N[action] += 1
+            Q[action] = Q[action] + alpha * (reward - Q[action])
+            rewards_history.append(reward)
+        result = {
+            "Q_values": Q,
+            "pull_counts": N,
+            "total_reward": sum(rewards_history),
+            "true_rewards": true_rewards
+        }
+        return result
+
+    # Yeni: Konuşma geçmişine mesaj ekleme
+    def add_chat_message(self, speaker, message):
+        timestamp = datetime.now().strftime("%H:%M:%S")
+        self.chat_history.append((timestamp, speaker, message))
+
+    # Yeni: Duygu analizi (sentiment)
+    def analyze_sentiment(self, text):
+        if self.sentiment_analyzer:
+            scores = self.sentiment_analyzer.polarity_scores(text)
+            compound = scores.get("compound", 0)
+            if compound >= 0.05:
+                return "pozitif"
+            elif compound <= -0.05:
+                return "negatif"
+            else:
+                return "nötr"
+        return "bilinmiyor"
+
+    # Yeni: Offline sesli çıktı (TTS)
+    def speak(self, text):
+        try:
+            self.tts_engine.say(text)
+            self.tts_engine.runAndWait()
+        except Exception as e:
+            print("TTS hatası:", e)
+
+    # Yeni: Offline sesli girdi (STT) – VOSK kullanımı
+    def get_speech_input(self, duration=5):
+        if not (vosk_available and self.vosk_model and self.speech_recognizer):
+            messagebox.showwarning("STT", "Offline ses tanıma kullanılamıyor.")
+            return ""
+        stream = self.pyaudio_instance.open(format=pyaudio.paInt16, channels=1, rate=16000, input=True, frames_per_buffer=8000)
+        stream.start_stream()
+        result_text = ""
+        start_time = time.time()
+        while time.time() - start_time < duration:
+            data = stream.read(4000, exception_on_overflow=False)
+            if self.speech_recognizer.AcceptWaveform(data):
+                res = json.loads(self.speech_recognizer.Result())
+                result_text += " " + res.get("text", "")
+        stream.stop_stream()
+        stream.close()
+        return result_text.strip()
+
+    # Yeni: İşlenmiş kullanıcı mesajına yanıt üretme (konuşma yönetimi)
+    def process_user_message(self, text):
+        self.add_chat_message("Kullanıcı", text)
+        sentiment = self.analyze_sentiment(text)
+        base_response = self.predict_with_tf_idf(text)
+        if sentiment == "negatif":
+            empathy = "Üzgün olduğunu görüyorum, yardımcı olabilmek için buradayım. "
+        elif sentiment == "pozitif":
+            empathy = "Pozitif enerjinizi görmek güzel! "
+        else:
+            empathy = ""
+        response = empathy + base_response
+        self.add_chat_message("Asistan", response)
+        return response
+
+    # Yeni: Konuşma geçmişinin özetini çıkarma (basit özetleme)
+    def summarize_conversation(self):
+        if not self.chat_history:
+            return "Henüz sohbet geçmişi yok."
+        summary_lines = []
+        for entry in self.chat_history[-5:]:
+            summary_lines.append(f"[{entry[0]}] {entry[1]}: {entry[2]}")
+        return "\n".join(summary_lines)
+
+    def launch_manual_mode_gui(self):
+        root = tk.Tk()
+        root.title("Melek - Manuel Mod Panel")
+        root.geometry("1200x800")
+        style = ttk.Style()
+        style.theme_use("clam")
+
+        notebook = ttk.Notebook(root)
+        notebook.pack(expand=1, fill="both")
+
+        # Tema ayarları
+        theme_colors = {"Açık Tema": "#FFFFFF", "Koyu Tema": "#333333", "Mavi Tema": "#ADD8E6", "Yeşil Tema": "#90EE90"}
+        def change_theme(color):
+            root.configure(bg=color)
+            for widget in root.winfo_children():
+                try:
+                    widget.configure(bg=color)
+                except:
+                    pass
+
+        # --- Veri İşlemleri Tab ---
+        data_frame = ttk.Frame(notebook, padding=10)
+        notebook.add(data_frame, text="Veri İşlemleri")
+        left_frame = ttk.Frame(data_frame, padding=10)
+        left_frame.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+        right_frame = ttk.Frame(data_frame, padding=10)
+        right_frame.pack(side=tk.RIGHT, fill=tk.BOTH, expand=True)
+
+        search_var = tk.StringVar()
+        ttk.Entry(left_frame, textvariable=search_var).pack(pady=5, padx=5, fill=tk.X)
+        tree = ttk.Treeview(left_frame, columns=("ID", "Question"), show="headings")
+        tree.heading("ID", text="ID")
+        tree.heading("Question", text="Soru")
+        tree.column("ID", width=50)
+        tree.column("Question", width=300)
+        tree.pack(pady=5, padx=5, fill=tk.BOTH, expand=True)
+
+        def refresh_tree():
+            for item in tree.get_children():
+                tree.delete(item)
+            for idx, item in enumerate(self.dataset):
+                tree.insert("", tk.END, values=(idx + 1, item["question"]))
+
+        refresh_tree()
+
+        def filter_data():
+            term = search_var.get().lower()
+            for item in tree.get_children():
+                tree.delete(item)
+            for idx, item in enumerate(self.dataset):
+                if term in item["question"].lower():
+                    tree.insert("", tk.END, values=(idx + 1, item["question"]))
+        search_var.trace("w", lambda *args: filter_data())
+
+        ttk.Label(right_frame, text="Soru:").pack(pady=(10, 0))
+        question_entry = ttk.Entry(right_frame, width=50)
+        question_entry.pack(pady=5)
+        ttk.Label(right_frame, text="Çözüm Adımları:").pack(pady=(10, 0))
+        steps_text = tk.Text(right_frame, height=5, width=50)
+        steps_text.pack(pady=5)
+        ttk.Label(right_frame, text="Nihai Cevap:").pack(pady=(10, 0))
+        final_entry = ttk.Entry(right_frame, width=50)
+        final_entry.pack(pady=5)
+
+        progress_bar = ttk.Progressbar(right_frame, mode="determinate")
+        progress_bar.pack(pady=5, fill=tk.X)
+
+        def on_select(event):
+            selection = tree.selection()
+            if selection:
+                idx = int(tree.item(selection[0])["values"][0]) - 1
+                item = self.dataset[idx]
+                question_entry.delete(0, tk.END)
+                question_entry.insert(0, item["question"])
+                steps_text.delete("1.0", tk.END)
+                steps_text.insert("1.0", item["answers"]["steps"])
+                final_entry.delete(0, tk.END)
+                final_entry.insert(0, item["answers"]["final"])
+
+        tree.bind("<<TreeviewSelect>>", on_select)
+
+        def add_record():
+            q = question_entry.get().strip()
+            steps = steps_text.get("1.0", tk.END).strip()
+            final = final_entry.get().strip()
+            if q and final:
+                self.dataset.append({"question": q, "answers": {"steps": steps, "final": final}})
+                self.train_tf_idf_model()
+                refresh_tree()
+            else:
+                messagebox.showerror("Hata", "Soru ve nihai cevap boş olamaz.")
+
+        def update_record():
+            selection = tree.selection()
+            if selection:
+                idx = int(tree.item(selection[0])["values"][0]) - 1
+                q = question_entry.get().strip()
+                steps = steps_text.get("1.0", tk.END).strip()
+                final = final_entry.get().strip()
+                if q and final:
+                    self.dataset[idx] = {"question": q, "answers": {"steps": steps, "final": final}}
+                    self.train_tf_idf_model()
+                    refresh_tree()
+                else:
+                    messagebox.showerror("Hata", "Soru ve nihai cevap boş olamaz.")
+            else:
+                messagebox.showerror("Hata", "Kayıt seçilmedi.")
+
+        def delete_record():
+            selection = tree.selection()
+            if selection:
+                idx = int(tree.item(selection[0])["values"][0]) - 1
+                del self.dataset[idx]
+                self.train_tf_idf_model()
+                refresh_tree()
+            else:
+                messagebox.showerror("Hata", "Kayıt seçilmedi.")
+
+        btn_frame = ttk.Frame(right_frame)
+        btn_frame.pack(pady=10)
+        ttk.Button(btn_frame, text="Ekle", command=add_record).grid(row=0, column=0, padx=5)
+        ttk.Button(btn_frame, text="Güncelle", command=update_record).grid(row=0, column=1, padx=5)
+        ttk.Button(btn_frame, text="Sil", command=delete_record).grid(row=0, column=2, padx=5)
+
+        def export_data():
+            file_path = filedialog.asksaveasfilename(defaultextension=".json", 
+                                                    filetypes=[("JSON", "*.json"), ("CSV", "*.csv"), ("SQLite DB", "*.db"), ("Parquet", "*.parquet")])
+            if file_path:
+                progress_bar["maximum"] = len(self.dataset)
+                progress_bar["value"] = 0
+                if file_path.endswith(".json"):
+                    with open(file_path, "w", encoding="utf-8") as f:
+                        json.dump(self.dataset, f, ensure_ascii=False, indent=4)
+                elif file_path.endswith(".csv"):
+                    with open(file_path, "w", encoding="utf-8", newline="") as f:
+                        writer = csv.DictWriter(f, fieldnames=["question", "answers"])
+                        writer.writeheader()
+                        for i, row in enumerate(self.dataset):
+                            row["answers"] = json.dumps(row["answers"])
+                            writer.writerow(row)
+                            progress_bar["value"] = i + 1
+                            progress_bar.update()
+                elif file_path.endswith(".db"):
+                    self.write_db(file_path, self.dataset)
+                elif file_path.endswith(".parquet"):
+                    write_parquet_simple(file_path, self.dataset)
+                messagebox.showinfo("Başarılı", "Veriler dışa aktarıldı.")
+
+        def import_data():
+            file_path = filedialog.askopenfilename(filetypes=[("JSON", "*.json"), ("CSV", "*.csv"), ("SQLite DB", "*.db"), ("Parquet", "*.parquet")])
+            if file_path:
+                if file_path.endswith(".json"):
+                    with open(file_path, "r", encoding="utf-8") as f:
+                        new_data = json.load(f)
+                elif file_path.endswith(".csv"):
+                    new_data = self.read_csv_to_json(file_path)
+                elif file_path.endswith(".db"):
+                    new_data = self.read_db_to_json(file_path)
+                elif file_path.endswith(".parquet"):
+                    new_data = read_parquet_simple(file_path)
+                if new_data:
+                    corrected_data, errors = self.validate_data(new_data, progress_bar)
+                    if errors:
+                        messagebox.showwarning("Uyarı", "\n".join(errors) + "\nEksik alanlar düzeltildi.")
+                    self.dataset.extend(corrected_data)
+                    self.train_tf_idf_model()
+                    refresh_tree()
+                    messagebox.showinfo("Başarılı", "Veriler içe aktarıldı.")
+
+        ttk.Button(right_frame, text="Dışa Aktar", command=export_data).pack(pady=5)
+        ttk.Button(right_frame, text="İçe Aktar", command=import_data).pack(pady=5)
+
+        # --- Ayarlar Tab ---
+        settings_frame = ttk.Frame(notebook, padding=10)
+        notebook.add(settings_frame, text="Ayarlar")
+        ttk.Label(settings_frame, text="Mod Seçimi:").grid(row=0, column=0, pady=5, padx=5)
+        mode_var = tk.StringVar(value="passive")
+        ttk.Combobox(settings_frame, textvariable=mode_var, values=("passive", "active", "command", "manual"), state="readonly").grid(row=0, column=1, pady=5, padx=5)
+        def change_mode():
+            self.mode = mode_var.get()
+            messagebox.showinfo("Mod Değiştirildi", f"Mod {self.mode} olarak ayarlandı.")
+        ttk.Button(settings_frame, text="Modu Değiştir", command=change_mode).grid(row=0, column=2, pady=5, padx=5)
+
+        def backup_data():
+            backup_file = filedialog.asksaveasfilename(defaultextension=".json", filetypes=[("JSON", "*.json")])
+            if backup_file:
+                with open(backup_file, "w", encoding="utf-8") as f:
+                    json.dump(self.dataset, f, ensure_ascii=False, indent=4)
+                messagebox.showinfo("Başarılı", "Veriler yedeklendi.")
+
+        def restore_data():
+            restore_file = filedialog.askopenfilename(filetypes=[("JSON", "*.json")])
+            if restore_file:
+                with open(restore_file, "r", encoding="utf-8") as f:
+                    self.dataset = json.load(f)
+                self.train_tf_idf_model()
+                refresh_tree()
+                messagebox.showinfo("Başarılı", "Veriler geri yüklendi.")
+
+        ttk.Button(settings_frame, text="Veri Yedekle", command=backup_data).grid(row=1, column=0, pady=5, padx=5)
+        ttk.Button(settings_frame, text="Veri Geri Yükle", command=restore_data).grid(row=1, column=1, pady=5, padx=5)
+
+        def select_theme():
+            theme_window = tk.Toplevel(root)
+            theme_window.title("Tema Seç")
+            theme_window.geometry("200x200")
+            for name, color in theme_colors.items():
+                ttk.Button(theme_window, text=name, command=lambda c=color: change_theme(c)).pack(pady=5)
+
+        ttk.Button(settings_frame, text="Tema Seç", command=select_theme).grid(row=2, column=0, pady=5, padx=5)
+        ttk.Button(settings_frame, text="Çıkış", command=lambda: root.destroy() if messagebox.askyesno("Çıkış", "Çıkmak istiyor musunuz?") else None).grid(row=2, column=1, pady=5, padx=5)
+
+        # --- Öğrenilen Veri Tab ---
+        learned_frame = ttk.Frame(notebook, padding=10)
+        notebook.add(learned_frame, text="Öğrenilen Veri")
+        learned_left = ttk.Frame(learned_frame, padding=10)
+        learned_left.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+        learned_right = ttk.Frame(learned_frame, padding=10)
+        learned_right.pack(side=tk.RIGHT, fill=tk.BOTH, expand=True)
+
+        ttk.Label(learned_left, text="Öğrenilen Veriler Listesi:").pack(pady=5)
+        learned_tree = ttk.Treeview(learned_left, columns=("File"), show="headings")
+        learned_tree.heading("File", text="Dosya Adı")
+        learned_tree.pack(pady=5, padx=5, fill=tk.BOTH, expand=True)
+        learned_progress = ttk.Progressbar(learned_left, mode="determinate")
+        learned_progress.pack(pady=5, fill=tk.X)
+
+        def refresh_learned_tree():
+            for item in learned_tree.get_children():
+                learned_tree.delete(item)
+            for filename in os.listdir(self.learned_data_folder):
+                if filename.lower().endswith((".json", ".csv", ".db", ".parquet")):
+                    learned_tree.insert("", tk.END, values=(filename,))
+
+        def reload_learned_data():
+            self.load_learned_data(learned_progress)
+            self.train_tf_idf_model()
+            refresh_learned_tree()
+
+        refresh_learned_tree()
+
+        def delete_learned_file():
+            selection = learned_tree.selection()
+            if selection:
+                filename = learned_tree.item(selection[0])["values"][0]
+                file_path = os.path.join(self.learned_data_folder, filename)
+                os.remove(file_path)
+                reload_learned_data()
+                messagebox.showinfo("Başarılı", "Dosya silindi.")
+            else:
+                messagebox.showerror("Hata", "Dosya seçilmedi.")
+
+        def add_new_learned_data():
+            add_window = tk.Toplevel(root)
+            add_window.title("Yeni Veri Ekle")
+            add_window.geometry("400x300")
+            ttk.Label(add_window, text="Soru:").pack(pady=5)
+            q_entry = ttk.Entry(add_window, width=50)
+            q_entry.pack(pady=5)
+            ttk.Label(add_window, text="Çözüm Adımları:").pack(pady=5)
+            a_text = tk.Text(add_window, height=5, width=50)
+            a_text.pack(pady=5)
+            ttk.Label(add_window, text="Nihai Cevap:").pack(pady=5)
+            f_entry = ttk.Entry(add_window, width=50)
+            f_entry.pack(pady=5)
+            def save_new_data():
+                q = q_entry.get().strip()
+                steps = a_text.get("1.0", tk.END).strip()
+                final = f_entry.get().strip()
+                if q and final:
+                    new_data = [{"question": q, "answers": {"steps": steps, "final": final}}]
+                    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+                    new_file = os.path.join(self.learned_data_folder, f"learned_data_{timestamp}.json")
+                    with open(new_file, "w", encoding="utf-8") as f:
+                        json.dump(new_data, f, ensure_ascii=False, indent=4)
+                    reload_learned_data()
+                    messagebox.showinfo("Başarılı", "Yeni veri eklendi.")
+                    add_window.destroy()
+                else:
+                    messagebox.showerror("Hata", "Soru ve nihai cevap boş olamaz.")
+            ttk.Button(add_window, text="Kaydet", command=save_new_data).pack(pady=10)
+
+        def import_learned_file():
+            file_path = filedialog.askopenfilename(filetypes=[("JSON", "*.json"), ("CSV", "*.csv"), ("SQLite DB", "*.db"), ("Parquet", "*.parquet")])
+            if file_path:
+                original_filename = os.path.basename(file_path)
+                if file_path.endswith(".json"):
+                    with open(file_path, "r", encoding="utf-8") as f:
+                        new_data = json.load(f)
+                elif file_path.endswith(".csv"):
+                    new_data = self.read_csv_to_json(file_path)
+                elif file_path.endswith(".db"):
+                    new_data = self.read_db_to_json(file_path)
+                elif file_path.endswith(".parquet"):
+                    new_data = read_parquet_simple(file_path)
+                if new_data:
+                    corrected_data, errors = self.validate_data(new_data, learned_progress)
+                    if errors:
+                        messagebox.showwarning("Uyarı", "\n".join(errors) + "\nEksik alanlar düzeltildi.")
+                    new_file = os.path.join(self.learned_data_folder, original_filename)
+                    with open(new_file, "w", encoding="utf-8") as f:
+                        json.dump(corrected_data, f, ensure_ascii=False, indent=4)
+                    reload_learned_data()
+                    messagebox.showinfo("Başarılı", "Harici veri eklendi (orijinal dosya adı korundu).")
+
+        ttk.Button(learned_left, text="Harici Veri Ekle", command=import_learned_file).pack(pady=5)
+        ttk.Button(learned_left, text="Seçili Dosyayı Sil", command=delete_learned_file).pack(pady=5)
+        ttk.Button(learned_left, text="Yeni Veri Ekle", command=add_new_learned_data).pack(pady=5)
+
+        guide_text = ("Kullanım Kılavuzu:\n• JSON, CSV, SQLite DB ve Parquet formatında veri ekleyebilirsiniz.\n• Orijinal dosya adları korunur.\n• Hatalı veriler kontrol edilir ve düzeltilir.\n• Silme ve ekleme işlemleri buradan yapılabilir.")
+        ttk.Label(learned_right, text=guide_text, justify=tk.LEFT, wraplength=400).pack(pady=10, padx=10)
+
+        # --- Veri Düzenleyici Tab ---
+        editor_frame = ttk.Frame(notebook, padding=10)
+        notebook.add(editor_frame, text="Veri Düzenleyici")
+        editor_left = ttk.Frame(editor_frame, padding=10)
+        editor_left.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+        editor_right = ttk.Frame(editor_frame, padding=10)
+        editor_right.pack(side=tk.RIGHT, fill=tk.BOTH, expand=True)
+
+        ttk.Label(editor_left, text="Veri Önizleme:").pack(pady=5)
+        editor_tree = ttk.Treeview(editor_left, columns=("ID", "Question", "Final"), show="headings")
+        editor_tree.heading("ID", text="ID")
+        editor_tree.heading("Question", text="Soru")
+        editor_tree.heading("Final", text="Nihai Cevap")
+        editor_tree.column("ID", width=50)
+        editor_tree.column("Question", width=200)
+        editor_tree.column("Final", width=100)
+        editor_tree.pack(pady=5, padx=5, fill=tk.BOTH, expand=True)
+
+        editor_progress = ttk.Progressbar(editor_left, mode="determinate")
+        editor_progress.pack(pady=5, fill=tk.X)
+
+        def refresh_editor_tree(data):
+            for item in editor_tree.get_children():
+                editor_tree.delete(item)
+            for idx, item in enumerate(data):
+                editor_tree.insert("", tk.END, values=(idx + 1, item["question"], item["answers"]["final"]))
+
+        ttk.Label(editor_right, text="Soru:").pack(pady=5)
+        edit_q_entry = ttk.Entry(editor_right, width=50)
+        edit_q_entry.pack(pady=5)
+        ttk.Label(editor_right, text="Çözüm Adımları:").pack(pady=5)
+        edit_steps_text = tk.Text(editor_right, height=5, width=50)
+        edit_steps_text.pack(pady=5)
+        ttk.Label(editor_right, text="Nihai Cevap:").pack(pady=5)
+        edit_f_entry = ttk.Entry(editor_right, width=50)
+        edit_f_entry.pack(pady=5)
+
+        def on_editor_select(event):
+            selection = editor_tree.selection()
+            if selection:
+                idx = int(editor_tree.item(selection[0])["values"][0]) - 1
+                item = current_data[idx]
+                edit_q_entry.delete(0, tk.END)
+                edit_q_entry.insert(0, item["question"])
+                edit_steps_text.delete("1.0", tk.END)
+                edit_steps_text.insert("1.0", item["answers"]["steps"])
+                edit_f_entry.delete(0, tk.END)
+                edit_f_entry.insert(0, item["answers"]["final"])
+
+        editor_tree.bind("<<TreeviewSelect>>", on_editor_select)
+
+        current_data = []
+
+        def load_data_for_edit():
+            file_path = filedialog.askopenfilename(filetypes=[("JSON", "*.json"), ("CSV", "*.csv"), ("SQLite DB", "*.db"), ("Parquet", "*.parquet")])
+            if file_path:
+                if file_path.endswith(".json"):
+                    with open(file_path, "r", encoding="utf-8") as f:
+                        new_data = json.load(f)
+                elif file_path.endswith(".csv"):
+                    new_data = self.read_csv_to_json(file_path)
+                elif file_path.endswith(".db"):
+                    new_data = self.read_db_to_json(file_path)
+                elif file_path.endswith(".parquet"):
+                    new_data = read_parquet_simple(file_path)
+                if new_data:
+                    global current_data
+                    current_data = [normalize_data_format(item) for item in new_data]
+                    refresh_editor_tree(current_data)
+                    messagebox.showinfo("Başarılı", "Veriler yüklendi.")
+
+        def save_edited_data():
+            if not current_data:
+                messagebox.showerror("Hata", "Düzenlenecek veri yok.")
+                return
+            file_path = filedialog.asksaveasfilename(defaultextension=".json", filetypes=[("JSON", "*.json")])
+            if file_path:
+                with open(file_path, "w", encoding="utf-8") as f:
+                    json.dump(current_data, f, ensure_ascii=False, indent=4)
+                messagebox.showinfo("Başarılı", "Düzenlenen veriler kaydedildi.")
+
+        def update_selected_record():
+            selection = editor_tree.selection()
+            if selection:
+                idx = int(editor_tree.item(selection[0])["values"][0]) - 1
+                q = edit_q_entry.get().strip()
+                steps = edit_steps_text.get("1.0", tk.END).strip()
+                final = edit_f_entry.get().strip()
+                if q and final:
+                    current_data[idx] = {"question": q, "answers": {"steps": steps, "final": final}}
+                    refresh_editor_tree(current_data)
+                else:
+                    messagebox.showerror("Hata", "Soru ve nihai cevap boş olamaz.")
+            else:
+                messagebox.showerror("Hata", "Kayıt seçilmedi.")
+
+        ttk.Button(editor_left, text="Veri Yükle", command=load_data_for_edit).pack(pady=5)
+        ttk.Button(editor_right, text="Kaydet", command=save_edited_data).pack(pady=5)
+        ttk.Button(editor_right, text="Seçileni Güncelle", command=update_selected_record).pack(pady=5)
+
+        # --- Makine Öğrenimi - TF-IDF (Temel ML) Tab ---
+        ml_frame = ttk.Frame(notebook, padding=10)
+        notebook.add(ml_frame, text="TF-IDF (Temel ML)")
+        ttk.Label(ml_frame, text="TF-IDF Modeli ile Tahmin", font=("Arial", 16)).pack(pady=10)
+
+        ml_progress = ttk.Progressbar(ml_frame, mode="determinate")
+        ml_progress.pack(pady=5, fill=tk.X)
+
+        ttk.Label(ml_frame, text="Tahmin için metin girin:").pack(pady=5)
+        predict_entry = ttk.Entry(ml_frame, width=50)
+        predict_entry.pack(pady=5)
+        def predict_tf_idf():
+            text = predict_entry.get().strip().lower()
+            if not text:
+                messagebox.showerror("Hata", "Metin girilmedi.")
+                return
+            prediction = self.predict_with_tf_idf(text)
+            messagebox.showinfo("Tahmin (TF-IDF)", f"Tahmin:\n{prediction}")
+        ml_btn_frame = ttk.Frame(ml_frame)
+        ml_btn_frame.pack(pady=10)
+        ttk.Button(ml_btn_frame, text="Modeli Yeniden Eğit", command=lambda: self.train_tf_idf_model(ml_progress)).grid(row=0, column=0, padx=5, pady=5)
+        ttk.Button(ml_btn_frame, text="Tahmin Et", command=predict_tf_idf).grid(row=0, column=1, padx=5, pady=5)
+
+        # --- Denetimli Öğrenme Tab (Supervised Learning) ---
+        supervised_frame = ttk.Frame(notebook, padding=10)
+        notebook.add(supervised_frame, text="Denetimli Öğrenme")
+        ttk.Label(supervised_frame, text="Denetimli Öğrenme (Supervised Learning)", font=("Arial", 16)).pack(pady=10)
+
+        sup_progress = ttk.Progressbar(supervised_frame, mode="determinate")
+        sup_progress.pack(pady=5, fill=tk.X)
+
+        ttk.Button(supervised_frame, text="Modeli Eğit", command=lambda: self.train_supervised_model(sup_progress)).pack(pady=5)
+        ttk.Label(supervised_frame, text="Tahmin için metin girin:").pack(pady=5)
+        sup_predict_entry = ttk.Entry(supervised_frame, width=50)
+        sup_predict_entry.pack(pady=5)
+        def predict_supervised():
+            text = sup_predict_entry.get().strip()
+            if not text:
+                messagebox.showerror("Hata", "Metin girilmedi.")
+                return
+            prediction = self.predict_supervised(text)
+            messagebox.showinfo("Tahmin (Denetimli)", f"Tahmin:\n{prediction}")
+        ttk.Button(supervised_frame, text="Tahmin Et", command=predict_supervised).pack(pady=5)
+
+        # --- Denetimsiz Öğrenme Tab (Unsupervised Learning) ---
+        unsupervised_frame = ttk.Frame(notebook, padding=10)
+        notebook.add(unsupervised_frame, text="Denetimsiz Öğrenme")
+        ttk.Label(unsupervised_frame, text="Denetimsiz Öğrenme (Unsupervised Learning) - Kümeleme", font=("Arial", 16)).pack(pady=10)
+
+        ttk.Label(unsupervised_frame, text="Küme sayısı (K):").pack(pady=5)
+        k_entry = ttk.Entry(unsupervised_frame, width=10)
+        k_entry.insert(0, "3")
+        k_entry.pack(pady=5)
+        def run_clustering():
+            try:
+                k = int(k_entry.get().strip())
+            except:
+                messagebox.showerror("Hata", "Geçerli bir küme sayısı girin.")
+                return
+            self.train_unsupervised_model(n_clusters=k)
+            clusters = self.get_unsupervised_clusters()
+            cluster_text.delete("1.0", tk.END)
+            for label, questions in clusters.items():
+                cluster_text.insert(tk.END, f"Küme {label}:\n")
+                for q in questions:
+                    cluster_text.insert(tk.END, f" - {q}\n")
+                cluster_text.insert(tk.END, "\n")
+        ttk.Button(unsupervised_frame, text="Kümelemeyi Başlat", command=run_clustering).pack(pady=5)
+        cluster_text = tk.Text(unsupervised_frame, height=15, width=80)
+        cluster_text.pack(pady=5)
+
+        # --- Takviyeli Öğrenme Tab (Reinforcement Learning) ---
+        rl_frame = ttk.Frame(notebook, padding=10)
+        notebook.add(rl_frame, text="Takviyeli Öğrenme")
+        ttk.Label(rl_frame, text="Takviyeli Öğrenme (Reinforcement Learning) - Multi-Armed Bandit", font=("Arial", 16)).pack(pady=10)
+
+        ttk.Label(rl_frame, text="Bölüm sayısı (Episodes):").pack(pady=5)
+        episodes_entry = ttk.Entry(rl_frame, width=10)
+        episodes_entry.insert(0, "1000")
+        episodes_entry.pack(pady=5)
+        ttk.Label(rl_frame, text="Epsilon (Keşif Oranı):").pack(pady=5)
+        epsilon_entry = ttk.Entry(rl_frame, width=10)
+        epsilon_entry.insert(0, "0.1")
+        epsilon_entry.pack(pady=5)
+        ttk.Label(rl_frame, text="Öğrenme Hızı (Alpha):").pack(pady=5)
+        alpha_entry = ttk.Entry(rl_frame, width=10)
+        alpha_entry.insert(0, "0.1")
+        alpha_entry.pack(pady=5)
+        rl_output = tk.Text(rl_frame, height=10, width=80)
+        rl_output.pack(pady=5)
+        def run_rl():
+            try:
+                episodes = int(episodes_entry.get().strip())
+                epsilon = float(epsilon_entry.get().strip())
+                alpha = float(alpha_entry.get().strip())
+            except:
+                messagebox.showerror("Hata", "Geçerli parametreler girin.")
+                return
+            result = self.run_rl_simulation(episodes, epsilon, alpha)
+            rl_output.delete("1.0", tk.END)
+            rl_output.insert(tk.END, f"Q Değerleri: {result['Q_values']}\n")
+            rl_output.insert(tk.END, f"Çekim Sayıları: {result['pull_counts']}\n")
+            rl_output.insert(tk.END, f"Toplam Ödül: {result['total_reward']}\n")
+            rl_output.insert(tk.END, f"Gerçek Ödül Olasılıkları: {result['true_rewards']}\n")
+            fig, ax = plt.subplots(figsize=(4,3))
+            arms = list(range(len(result['Q_values'])))
+            ax.bar(arms, result['Q_values'], color='skyblue')
+            ax.set_xlabel("Kolu")
+            ax.set_ylabel("Q Değeri")
+            ax.set_title("Her Kolun Q Değeri")
+            canvas = FigureCanvasTkAgg(fig, master=rl_frame)
+            canvas.draw()
+            canvas.get_tk_widget().pack(pady=5)
+        ttk.Button(rl_frame, text="Simülasyonu Başlat", command=run_rl).pack(pady=5)
+
+        # --- Chat Tab (Sohbet ve Diyalog Yönetimi) ---
+        chat_frame = ttk.Frame(notebook, padding=10)
+        notebook.add(chat_frame, text="Chat")
+        chat_history_text = tk.Text(chat_frame, height=20, width=100, state=tk.DISABLED)
+        chat_history_text.pack(pady=5)
+        chat_entry = ttk.Entry(chat_frame, width=80)
+        chat_entry.pack(pady=5, side=tk.LEFT, padx=5)
+        def update_chat_history():
+            chat_history_text.configure(state=tk.NORMAL)
+            chat_history_text.delete("1.0", tk.END)
+            for entry in self.chat_history:
+                chat_history_text.insert(tk.END, f"[{entry[0]}] {entry[1]}: {entry[2]}\n")
+            chat_history_text.configure(state=tk.DISABLED)
+        def send_chat_message():
+            text = chat_entry.get().strip()
+            if not text:
+                messagebox.showerror("Hata", "Mesaj girilmedi.")
+                return
+            response = self.process_user_message(text)
+            update_chat_history()
+            chat_entry.delete(0, tk.END)
+            messagebox.showinfo("Yanıt", response)
+        ttk.Button(chat_frame, text="Gönder", command=send_chat_message).pack(pady=5, side=tk.LEFT)
+        def speech_input():
+            result = self.get_speech_input()
+            if result:
+                chat_entry.delete(0, tk.END)
+                chat_entry.insert(0, result)
+        ttk.Button(chat_frame, text="Sesle Gönder", command=speech_input).pack(pady=5, side=tk.LEFT, padx=5)
+        def speak_last_message():
+            if self.chat_history:
+                last_message = self.chat_history[-1][2]
+                self.speak(last_message)
+        ttk.Button(chat_frame, text="Sesle Oku", command=speak_last_message).pack(pady=5, side=tk.LEFT, padx=5)
+        def show_summary():
+            summary = self.summarize_conversation()
+            messagebox.showinfo("Sohbet Özeti", summary)
+        ttk.Button(chat_frame, text="Sohbet Özeti", command=show_summary).pack(pady=5, side=tk.LEFT, padx=5)
+
+        root.mainloop()
+
+    def main_loop(self):
+        print("Çıkmak için 'exit' ya da 'quit' yazabilirsiniz.")
+        while True:
+            user_input = input(">> ").strip()
+            if user_input.lower() in ["exit", "quit"]:
+                print("Çıkılıyor...")
+                break
+            lower_input = user_input.lower()
+            if "melek" in lower_input:
+                self.mode = "active"
+                print("Aktif Mod'a geçildi.")
+            elif "pasif mod" in lower_input:
+                self.mode = "passive"
+                print("Pasif Mod'a geçildi.")
+            elif "komut mod" in lower_input:
+                self.mode = "command"
+                print("Komut Mod'a geçildi.")
+            elif "manuel mod" in lower_input:
+                self.mode = "manual"
+                print("Manuel Mod'a geçildi. GUI açılıyor...")
+                self.launch_manual_mode_gui()
+                self.mode = "passive"
+                print("Mod pasif moda alındı.")
+            elif self.mode == "passive":
+                self.log_passive_mode(user_input)
+            elif self.mode == "active":
+                if "saat" in lower_input:
+                    now = datetime.now()
+                    print(self.convert_time_to_words(now.hour, now.minute))
+                else:
+                    print(self.find_best_response(user_input))
+            elif self.mode == "command":
+                self.handle_command_mode(user_input)
+
+if __name__ == "__main__":
+    dataset_file = r"C:\Users\muhte\OneDrive\Masaüstü\sentetik veri sohbet\hepsi ibrleşmiş sohbet verisi.json"
+    assistant = MelekAssistant(dataset_file)
+    assistant.main_loop()
